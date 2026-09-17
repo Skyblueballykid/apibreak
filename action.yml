@@ -1,0 +1,33 @@
+name: "APIBreak"
+description: "Reports the vendor API changes that touch the endpoints you declare, and nothing else. No credentials, no repository access."
+author: "Skyblueballykid"
+branding:
+  icon: "radio"
+  color: "green"
+inputs:
+  manifest:
+    description: "Path to apibreak.json — the endpoints you call and the specification revision you pinned."
+    required: false
+    default: "apibreak.json"
+  fail-on:
+    description: "Lowest severity that fails the job: breaking, deprecation, unknown or never."
+    required: false
+    default: "breaking"
+  github-token:
+    description: "Optional. Only raises the rate limit on the public commit listings this reads; no repository access is used."
+    required: false
+    default: ""
+outputs:
+  breaking:
+    description: "Count of breaking findings."
+  deprecation:
+    description: "Count of newly deprecated operations."
+  unknown:
+    description: "Count of things the check refused to guess about."
+  findings:
+    description: "Total findings."
+  report-json:
+    description: "The full report as JSON."
+runs:
+  using: "node24"
+  main: "dist/index.js"
