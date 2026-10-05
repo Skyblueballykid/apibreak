@@ -391,10 +391,113 @@ test('resolveUrl: known host, other host, variable base, bare path, prefix candi
   const bases = serverBases({ servers: [{ url: 'https://api.t.test/v1' }] });
   assert.deepEqual(resolveUrl('https://api.t.test/v1/a?x=1', bases), { kind: 'path', candidates: ['/a', '/v1/a'] });
   assert.deepEqual(resolveUrl('https://evil.test/v1/a', bases), { kind: 'other-host', host: 'evil.test' });
-  assert.deepEqual(resolveUrl('{{baseUrl}}/v1/a', bases), { kind: 'path', candidates: ['/a', '/v1/a'] });
-  assert.deepEqual(resolveUrl('YOUR_API_URL/a', bases), { kind: 'path', candidates: ['/a'] });
+  assert.deepEqual(resolveUrl('{{baseUrl}}/v1/a', bases), { kind: 'path', candidates: ['/a', '/v1/a'], variableHost: '{{baseUrl}}' });
+  assert.deepEqual(resolveUrl('YOUR_API_URL/a', bases), { kind: 'path', candidates: ['/a'], variableHost: 'YOUR_API_URL' });
   assert.equal(resolveUrl('a/b', bases).kind, 'unresolved');
   assert.deepEqual(resolveUrl('/v1/%7Bid%7D', bases), { kind: 'path', candidates: ['/{id}', '/v1/{id}'] });
+});
+
+test('guard: a <placeholder> in a curl URL is a path value, and options after it still count (Clerk revoke-invitation)', () => {
+  const raw: Json = {
+    openapi: '3.0.3',
+    info: { title: 'T', version: '1' },
+    servers: [{ url: 'https://api.t.test/v1' }],
+    paths: { '/invitations/{invitation_id}/revoke': { post: { responses: { 200: { description: 'ok' } } } } },
+  };
+  const r = run(curlBlock('curl https://api.t.test/v1/invitations/<invitation_id>/revoke -X POST -H "Authorization: Bearer <SECRET_KEY>"'), raw);
+  assert.deepEqual(r.findings, []);
+  assert.equal(r.checked, 1);
+  // A placeholder in the host is the reader's own deployment, never "no path matches /".
+  const host = run(curlBlock('curl https://<database_name>-<org>.turso.io/v1/invitations/i_1/revoke -X POST'), raw);
+  assert.deepEqual(host.findings, []);
+});
+
+test('guard: a placeholder host is this API only when the path says so; otherwise it is skipped as another host', () => {
+  // The reader's own app behind a placeholder host (Upstash, Fly, ngrok guides): skipped, counted.
+  const app = run(curlBlock('curl -X POST https://<YOUR-PRODUCTION-URL>/api/workflow', 'curl -X POST <DEPLOYMENT_URL>/workflow'));
+  assert.deepEqual(app.findings, []);
+  assert.equal(app.checked, 0);
+  assert.deepEqual(app.ignored.map((i) => i.host), ['<your-production-url>', '<DEPLOYMENT_URL>']);
+  // A path that fits the spec, or that starts with the server prefix, is still this API and still judged.
+  const fits = run(curlBlock('curl -X PUT https://<your-host>/users/u_1', 'curl https://<your-host>/v1/userz'));
+  assert.deepEqual(fits.findings.map((f) => f.rule), ['wrong-method', 'unknown-endpoint']);
+});
+
+test('guard: a URL passed as the last path segment stays one value (QStash /v2/publish/{destination})', () => {
+  const raw: Json = {
+    openapi: '3.0.3',
+    info: { title: 'T', version: '1' },
+    servers: [{ url: 'https://qstash.t.test' }],
+    paths: { '/v2/publish/{destination}': { post: { responses: { 200: { description: 'ok' } } } } },
+  };
+  assert.deepEqual(resolveUrl('https://qstash.t.test/v2/publish/https://example.com/hook', serverBases(raw)), {
+    kind: 'path',
+    candidates: ['/v2/publish/https%3A%2F%2Fexample.com%2Fhook'],
+  });
+  const r = run(curlBlock('curl -X POST https://qstash.t.test/v2/publish/https://example.com/hook -d "{}"'), raw);
+  assert.deepEqual(r.findings, []);
+});
+
+test('guard: a curl command quoted in an inline code span ends at the closing backtick (Typesense health)', () => {
+  const r = run(['```', '- `curl https://api.t.test/v1/users` - list users', '```'].join('\n'));
+  assert.deepEqual(r.findings, []);
+  assert.equal(r.checked, 1);
+});
+
+test('guard: a paired backtick substitution is opaque text, not the end of the command', () => {
+  const r = run(curlBlock('curl https://api.t.test/v1/users -H X-Token:`cat token.txt` -X POST -d \'{"email": "a@b.c"}\''));
+  assert.deepEqual(rules(r.findings), []);
+  assert.equal(r.checked, 1);
+  // A substitution in the URL is an unknown value, never literal segments (`cat /tmp/id` is not /tmp/id).
+  const sub = run(curlBlock('curl https://api.t.test/v1/users/`cat /tmp/id`'));
+  assert.deepEqual(rules(sub.findings), []);
+  // A command opened by a backtick ends at the first unescaped one.
+  const nested = run(curlBlock('echo `curl https://api.t.test/v1/users -H X-Token:\\`printf token\\` -X POST -d \'{"email": "a@b.c"}\'`'));
+  assert.deepEqual(rules(nested.findings), []);
+  assert.equal(nested.checked, 1);
+  // Two inline commands on one line are two references, each ending at its own closing backtick.
+  const two = run(['```', '- `curl https://api.t.test/v1/users` and `curl https://api.t.test/v1/users/me`', '```'].join('\n'));
+  assert.deepEqual(two.findings, []);
+  assert.equal(two.checked, 2);
+});
+
+test('guard: a placeholder host the spec\'s own templated server matches is this API, and still judged', () => {
+  const raw: Json = {
+    openapi: '3.0.3',
+    info: { title: 'T', version: '1' },
+    servers: [{ url: 'https://{tenant}.example.com', variables: { tenant: { default: 'acme' } } }],
+    paths: { '/users': { get: { responses: { 200: { description: 'ok' } } } } },
+  };
+  const r = run(curlBlock('curl https://{tenant}.example.com/removed'), raw);
+  assert.deepEqual(rules(r.findings), ['unknown-endpoint@2']);
+  assert.equal(r.ignored.length, 0);
+});
+
+test('guard: PowerShell backticks are escapes, a double-backtick span closes on its own run, quoted substitutions are unknown values', () => {
+  const ps = run(['```powershell', 'curl.exe https://api.t.test/v1/users?limit=1`&offset=2 -X POST -d "{}"', '```'].join('\n'));
+  assert.ok(!rules(ps.findings).some((r) => r.startsWith('wrong-method')), JSON.stringify(ps.findings));
+  const span = run(['```text', "- ``curl https://api.t.test/v1/users -H 'X-Note: a`b' -X POST -d '{\"email\": \"a@b.c\"}'``", '```'].join('\n'));
+  assert.deepEqual(rules(span.findings), []);
+  assert.equal(span.checked, 1);
+  const quoted = run(curlBlock('curl "https://api.t.test/v1/users/`cat /tmp/id`"'));
+  assert.deepEqual(rules(quoted.findings), []);
+  // A path built by a substitution is unresolved, never judged by its assumed shape.
+  const built = run(curlBlock('curl https://api.t.test/v1/`printf users/me`'));
+  assert.deepEqual(rules(built.findings), []);
+  assert.equal(built.unresolved.length, 1);
+  // A PowerShell escaped quote inside a double-quoted string does not end it.
+  const psq = run(['```powershell', 'curl.exe https://api.t.test/v1/users -H "X-Note: a`";b" -X POST -d "{}"', '```'].join('\n'));
+  assert.ok(!rules(psq.findings).some((r) => r.startsWith('wrong-method')), JSON.stringify(psq.findings));
+});
+
+test('guard: a URL embedded as the very first path segment is one value too', () => {
+  const raw: Json = {
+    openapi: '3.0.3',
+    info: { title: 'T', version: '1' },
+    servers: [{ url: 'https://api.t.test' }],
+    paths: { '/{destination}': { post: { responses: { 200: { description: 'ok' } } } } },
+  };
+  assert.deepEqual(rules(run(curlBlock('curl -X POST https://api.t.test/https://example.com/hook'), raw).findings), []);
 });
 
 test('serverBases: Swagger 2 host+basePath, server variables, path-level servers, no servers', () => {

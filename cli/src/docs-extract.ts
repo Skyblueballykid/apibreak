@@ -310,17 +310,31 @@ export function proseReferences(text: string): Array<{ method: Method; url: stri
 // --------------------------------------------------------------------- curl --
 
 const SHELL_LANGS = new Set(['', 'bash', 'sh', 'shell', 'zsh', 'console', 'terminal', 'curl', 'shellsession', 'shell-session', 'cmd', 'bat', 'powershell', 'ps', 'ps1', 'pwsh', 'text', 'txt', 'plaintext', 'sh-session', 'fish']);
+const POWERSHELL_LANGS = new Set(['powershell', 'ps1', 'pwsh', 'ps']);
 const HTTP_LANGS = new Set(['http', 'rest', 'restclient', 'httpspec', 'request']);
 const JS_LANGS = new Set(['js', 'javascript', 'ts', 'typescript', 'jsx', 'tsx', 'mjs', 'cjs', 'node', 'mts']);
 const PY_LANGS = new Set(['py', 'python', 'python3', 'py3', 'ipython', 'pycon']);
 
+/** Index of the next backtick at or after `from` that is not backslash-escaped, or -1. */
+function closingBacktick(s: string, from: number): number {
+  for (let i = from; i < s.length; i++) {
+    if (s[i] === '\\') i += 1;
+    else if (s[i] === '`') return i;
+  }
+  return -1;
+}
+
+/** What a paired `...` command substitution stands for: its output is unknown, so it reads as a placeholder. */
+export const SUBSTITUTION = '{cmd}';
+
 /**
  * Shell words of one command, up to the first unquoted `|`, `;`, `&&`, `||`,
  * `)`, redirect or comment. Quotes are removed and adjacent pieces joined, as
- * a shell would; `$VAR` is left as text. `heredoc` is set when the command
- * reads a here-document, whose contents are not followed.
+ * a shell would; `$VAR` is left as text, a backtick substitution becomes
+ * SUBSTITUTION. `heredoc` is set when the command reads a here-document,
+ * whose contents are not followed. `powershell`: the backtick is an escape.
  */
-export function shellWords(cmd: string): { words: string[]; heredoc: boolean } {
+export function shellWords(cmd: string, opts: { powershell?: boolean } = {}): { words: string[]; heredoc: boolean } {
   const words: string[] = [];
   let cur = '';
   let has = false;
@@ -355,6 +369,18 @@ export function shellWords(cmd: string): { words: string[]; heredoc: boolean } {
           i += 2;
           continue;
         }
+        if (opts.powershell && cmd[i] === '`' && i + 1 < cmd.length) {
+          cur += cmd[i + 1];
+          i += 2;
+          continue;
+        }
+        // A substitution inside double quotes is still one: an unknown value.
+        const close = cmd[i] === '`' && !opts.powershell ? closingBacktick(cmd, i + 1) : -1;
+        if (close !== -1) {
+          cur += SUBSTITUTION;
+          i = close + 1;
+          continue;
+        }
         cur += cmd[i];
         i += 1;
       }
@@ -374,9 +400,39 @@ export function shellWords(cmd: string): { words: string[]; heredoc: boolean } {
       continue;
     }
     if (c === '#' && !has) break;
-    if (c === '<' && cmd[i + 1] === '<') {
-      heredoc = true;
-      break;
+    if (c === '<') {
+      // `<invitation_id>` is a docs placeholder, not a redirect: read as one,
+      // its `>` cut the URL short and dropped every option after it (`-X POST`).
+      const placeholder = /^<[A-Za-z_][\w.-]*>/.exec(cmd.slice(i));
+      if (placeholder) {
+        cur += placeholder[0];
+        has = true;
+        i += placeholder[0].length;
+        continue;
+      }
+      if (cmd[i + 1] === '<') {
+        heredoc = true;
+        break;
+      }
+    }
+    // PowerShell's escape character is the backtick (`&, `"), not a substitution.
+    if (c === '`' && opts.powershell) {
+      if (i + 1 < cmd.length) cur += cmd[i + 1];
+      has = true;
+      i += 2;
+      continue;
+    }
+    if (c === '`') {
+      // A paired `...` is a command substitution whose output is unknown: a
+      // placeholder, never its own text read as path segments. An unpaired
+      // one closes the inline code span or substitution the command was
+      // quoted in (`curl http://host/health`): the end.
+      const end = closingBacktick(cmd, i + 1);
+      if (end === -1) break;
+      cur += SUBSTITUTION;
+      has = true;
+      i = end + 1;
+      continue;
     }
     if (c === '|' || c === ';' || c === ')' || c === '>' || (c === '&' && cmd[i + 1] === '&')) break;
     cur += c;
@@ -581,7 +637,7 @@ export function parseCurl(words: string[], heredoc = false): Parsed {
 /** Logical lines (backslash, or PowerShell backtick, continuations joined) with their first physical line. */
 function logicalLines(lines: string[], lang: string): Array<{ text: string; offset: number }> {
   const out: Array<{ text: string; offset: number }> = [];
-  const cont = lang === 'powershell' || lang === 'ps1' || lang === 'pwsh' || lang === 'ps' ? /[`\\]\s*$/ : /\\\s*$/;
+  const cont = POWERSHELL_LANGS.has(lang) ? /[`\\]\s*$/ : /\\\s*$/;
   let buf = '';
   let start = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -607,7 +663,7 @@ function logicalLines(lines: string[], lang: string): Array<{ text: string; offs
  * separator or a command name — `echo "; curl /removed"` is one command,
  * not two — so the command-position search below must never see it.
  */
-function maskShellQuotes(line: string): string {
+function maskShellQuotes(line: string, powershell = false): string {
   let out = '';
   let i = 0;
   while (i < line.length) {
@@ -622,7 +678,7 @@ function maskShellQuotes(line: string): string {
     if (c === '"') {
       let j = i + 1;
       while (j < line.length && line[j] !== '"') {
-        j += line[j] === '\\' && j + 1 < line.length ? 2 : 1;
+        j += (line[j] === '\\' || (powershell && line[j] === '`')) && j + 1 < line.length ? 2 : 1;
       }
       const stop = j < line.length ? j + 1 : line.length;
       out += ' '.repeat(stop - i);
@@ -637,6 +693,7 @@ function maskShellQuotes(line: string): string {
 
 function curlInBlock(block: CodeBlock): Array<{ offset: number; snippet: string; parsed: Parsed }> {
   const out: Array<{ offset: number; snippet: string; parsed: Parsed }> = [];
+  const powershell = POWERSHELL_LANGS.has(block.lang);
   for (const { text, offset } of logicalLines(block.lines, block.lang)) {
     // A prompt (`$ `, `% `, `> `, `PS> `) is not part of the command.
     const line = text.replace(/^\s*(?:PS[^>]*>|[$%>])\s+/, '');
@@ -647,10 +704,22 @@ function curlInBlock(block: CodeBlock): Array<{ offset: number; snippet: string;
     // `curl` spelled out inside quotes is invisible to this search; the
     // ORIGINAL line (same indices) is still what gets parsed.
     const re = /(?:^\s*|[;&|]\s*|\$\(\s*|`\s*|\b(?:sudo|time|exec|then|do|xargs)\s+)(curl(?:\.exe)?)(?=\s|$)/g;
-    const masked = maskShellQuotes(line);
+    const masked = maskShellQuotes(line, powershell);
     for (const m of masked.matchAll(re)) {
       const at = (m.index ?? 0) + m[0].indexOf(m[1]!);
-      const { words, heredoc } = shellWords(line.slice(at));
+      // Opened by a backtick (`curl …` inline, or a substitution): it ends at
+      // the matching close — the next unescaped backtick, or for a ``double``
+      // code span the next run of the same length (a lone backtick inside is text).
+      const run = /`+$/.exec(line.slice(0, at).replace(/\s+$/, ''))?.[0].length ?? 0;
+      let close = -1;
+      if (run === 1 && !powershell) {
+        close = closingBacktick(line, at);
+      } else if (run > 1) {
+        const delimiter = new RegExp(`(?<!\`)\`{${run}}(?!\`)`, 'g');
+        delimiter.lastIndex = at;
+        close = delimiter.exec(line)?.index ?? -1;
+      }
+      const { words, heredoc } = shellWords(close === -1 ? line.slice(at) : line.slice(at, close), { powershell });
       if (words.length < 2) continue;
       out.push({ offset, snippet: snippetOf(line.slice(at)), parsed: parseCurl(words, heredoc) });
     }

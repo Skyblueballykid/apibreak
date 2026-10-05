@@ -61,7 +61,7 @@ npx apibreak check --manifest apibreak.json
 Or add it to a project with `npm i -D apibreak`. The package is one bundled
 file, a README and a licence — **no dependencies**, **no install scripts** —
 and it needs Node 20 or newer. It is early access at
-[`apibreak@0.3.1`](https://www.npmjs.com/package/apibreak), two vendors, and
+[`apibreak@0.3.2`](https://www.npmjs.com/package/apibreak), two vendors, and
 the interface may still change.
 
 The Action wraps this same check and adds the annotations and job summary
@@ -237,7 +237,7 @@ threshold except `never`; `not compared` and `advisory` findings never fail.
 ## Status
 
 Early access, and honestly labelled as such: the Action and the CLI — published
-on npm as [`apibreak@0.3.1`](https://www.npmjs.com/package/apibreak) — are free
+on npm as [`apibreak@0.3.2`](https://www.npmjs.com/package/apibreak) — are free
 and always will be. A hosted version that emails you a weekly report without a
 CI job is proposed at $49/org/month — [apibreak.dev](https://apibreak.dev) has
 the worked example and the detail. No SLA, no real-time protection, and no

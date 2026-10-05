@@ -1,6 +1,6 @@
 # apibreak
 
-**Early access (0.3.1).** Two vendors, no SLA, and the interface may still
+**Early access (0.3.2).** Two vendors, no SLA, and the interface may still
 change. It is published so that people can try it and tell me where it is
 wrong.
 
@@ -315,6 +315,24 @@ The Action wraps this same check and additionally emits workflow error
 annotations and a job summary.
 
 ## Changelog
+
+### 0.3.2 — 2026-10-05
+
+Fewer false positives from `apibreak docs`, found by running it on 31 public
+API docs repositories (876 raw findings before, 716 after; every finding that
+disappeared was a misread example):
+
+- A `<placeholder>` in a curl URL (`/invitations/<invitation_id>/revoke`) is
+  read as a path value. Its `>` used to be taken for a redirect, which cut the
+  URL short and dropped every option after it, `-X POST` included.
+- A placeholder host (`https://<your-app>.fly.dev`, `<DEPLOYMENT_URL>`) is
+  treated as this API only when the path fits the spec or starts with a server
+  prefix; otherwise it is skipped and counted like any other host.
+- A URL passed as a path segment (`/v2/publish/https://example.com`) stays one
+  value instead of being collapsed and split.
+- A curl command quoted in inline code ends at its closing backtick; a
+  backtick command substitution is an unknown value, and a path built from one
+  is not checked; PowerShell backtick escapes are read as escapes.
 
 ### 0.3.1 — 2026-10-05
 

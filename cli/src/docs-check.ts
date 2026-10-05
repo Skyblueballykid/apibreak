@@ -11,7 +11,7 @@
  * to argue with. A docs check that cries wolf gets deleted from CI.
  */
 
-import type { BodyRef, DocReference } from './docs-extract.js';
+import { SUBSTITUTION, type BodyRef, type DocReference } from './docs-extract.js';
 import { closestTemplate, matchDocPath, nameDistance, operationServerBases, serverBases, type ServerBase } from './match-endpoints.js';
 import { deref, parameters, type Json, type Operation, type SpecDoc } from './spec.js';
 import { METHODS, type Method } from './types.js';
@@ -77,7 +77,8 @@ export interface CheckResult {
 // ------------------------------------------------------------ URL → path --
 
 export type Resolved =
-  | { kind: 'path'; candidates: string[] }
+  /** `variableHost`: the host was a placeholder or variable (`<your-app>.fly.dev`, `$API`), as written. */
+  | { kind: 'path'; candidates: string[]; variableHost?: string }
   | { kind: 'other-host'; host: string }
   | { kind: 'unresolved'; reason: string };
 
@@ -113,27 +114,44 @@ const LEADING_VARIABLE = /^(?:\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|\{\{[^}]+\}\}
 export function resolveUrl(url: string, bases: ServerBase[]): Resolved {
   let rest = url.split('#')[0]!.split('?')[0]!.trim();
   let hostKnown: ServerBase[] | null = null;
+  let variableHost: string | undefined;
 
   const abs = /^(?:[a-z][a-z0-9+.-]*:)?\/\/([^/?#]*)(.*)$/i.exec(rest);
   const bareHost = /^((?:localhost|[\w-]+(?:\.[\w-]+)+)(?::\d+)?)(\/.*)$/i.exec(rest);
   if (abs || bareHost) {
     const host = (abs ? abs[1]! : bareHost![1]!).toLowerCase();
     rest = (abs ? abs[2]! : bareHost![2]!) || '/';
-    if (LEADING_VARIABLE.test(host) || /^\{|\$|</.test(host)) {
-      hostKnown = null; // a variable host: whatever the reader's deployment is
-    } else {
-      const matching = bases.filter((b) => b.host?.test(host));
-      if (matching.length === 0) return { kind: 'other-host', host };
+    // A host the spec's own servers match (templated ones included, so
+    // `{tenant}.example.com` against `https://{tenant}.example.com`) is this API.
+    const matching = bases.filter((b) => b.host?.test(host));
+    if (matching.length > 0) {
       hostKnown = matching;
+    } else if (LEADING_VARIABLE.test(host) || /^\{|\$|</.test(host)) {
+      hostKnown = null; // a variable host: whatever the reader's deployment is
+      variableHost = host;
+    } else {
+      return { kind: 'other-host', host };
     }
   } else {
     const v = LEADING_VARIABLE.exec(rest);
     if (v) {
+      variableHost = v[0];
       rest = rest.slice(v[0].length);
       if (rest === '' || rest === '/') return { kind: 'unresolved', reason: `"${url}" is only a base-URL variable, with no path to check` };
     }
     if (!rest.startsWith('/')) return { kind: 'unresolved', reason: `"${url}" does not start with a path, a known host or a base-URL variable` };
   }
+
+  // A URL passed as the last path segment (`/v2/publish/https://example.com`)
+  // is one parameter value: kept whole as a single segment, never collapsed
+  // into `https:/example.com` and split across segments the spec does not have.
+  const embedded = /\/[a-z][a-z0-9+.-]*:\/\//i.exec(rest);
+  if (embedded) {
+    rest = `${rest.slice(0, embedded.index + 1)}${encodeURIComponent(rest.slice(embedded.index + 1))}`;
+  }
+
+  // A path built by a command substitution could be any number of segments.
+  if (rest.includes(SUBSTITUTION)) return { kind: 'unresolved', reason: `"${url}" builds its path with a command substitution` };
 
   // Percent-encoded braces are still placeholders; anything else stays as written.
   rest = rest.replace(/%7B/gi, '{').replace(/%7D/gi, '}').replace(/\/{2,}/g, '/');
@@ -146,7 +164,7 @@ export function resolveUrl(url: string, bases: ServerBase[]): Resolved {
     if (rest === prefix || rest.startsWith(`${prefix}/`)) candidates.push(rest.slice(prefix.length) || '/');
   }
   candidates.push(rest);
-  return { kind: 'path', candidates: [...new Set(candidates)] };
+  return { kind: 'path', candidates: [...new Set(candidates)], ...(variableHost ? { variableHost } : {}) };
 }
 
 // ------------------------------------------------------- schema reading --
@@ -321,6 +339,19 @@ export function checkReferences(refs: DocReference[], spec: SpecDoc, opts: Check
     }
     if (resolved.kind === 'unresolved') {
       result.unresolved.push({ ref, reason: resolved.reason });
+      continue;
+    }
+    // A placeholder host (`<your-app>.fly.dev`, `<DEPLOYMENT_URL>`, `$HOST`) is
+    // as often the reader's own app as this API. It counts as this API only
+    // when the path says so — it fits a spec path, or starts with a server
+    // prefix — and is otherwise skipped like any other host, never reported
+    // as an unknown endpoint of an API it may not be calling.
+    if (
+      resolved.variableHost !== undefined &&
+      resolved.candidates.length === 1 &&
+      matchDocPath(resolved.candidates[0]!, templates).length === 0
+    ) {
+      result.ignored.push({ file: ref.file, line: ref.line, snippet: ref.snippet, host: resolved.variableHost });
       continue;
     }
     result.checked += 1;

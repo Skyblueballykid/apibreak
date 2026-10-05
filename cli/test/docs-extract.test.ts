@@ -47,6 +47,13 @@ test('shellWords: stops at a pipe, a redirect, && and a comment; flags a here-do
   assert.deepEqual(shellWords('curl https://h/x > out.json').words, ['curl', 'https://h/x']);
   assert.deepEqual(shellWords('curl https://h/x && echo ok').words, ['curl', 'https://h/x']);
   assert.deepEqual(shellWords('curl https://h/x # list').words, ['curl', 'https://h/x']);
+  assert.deepEqual(shellWords('curl https://h/x` - check health').words, ['curl', 'https://h/x']);
+  assert.deepEqual(shellWords('curl https://h/x -H T:`cat t` -X POST').words, ['curl', 'https://h/x', '-H', 'T:{cmd}', '-X', 'POST']);
+  // An escaped backtick inside a substitution does not close it.
+  assert.deepEqual(shellWords('curl https://h/x -H T:`printf \\`printf t\\`` -X POST').words, ['curl', 'https://h/x', '-H', 'T:{cmd}', '-X', 'POST']);
+  // `<name>` is a placeholder, not a redirect; `< file` and `<<EOF` still are what they look like.
+  assert.deepEqual(shellWords('curl https://h/a/<ID>/b -X POST').words, ['curl', 'https://h/a/<ID>/b', '-X', 'POST']);
+  assert.deepEqual(shellWords('curl https://h/x > out.json <in').words, ['curl', 'https://h/x']);
   assert.equal(shellWords('curl -d @- https://h/x <<EOF').heredoc, true);
 });
 
